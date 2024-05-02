@@ -38,16 +38,20 @@ class Globalarrays(AutotoolsPackage):
     variant("scalapack", default=False, description="Enable SCALAPACK")
     variant(
         "armci",
-        values=("mpi-ts", "mpi-pr", "mpi3", "openib", "ofi"),
+        values=("mpi-ts", "mpi-pr", "mpi3", "openib", "ofi", "armcimpi"),
         default="mpi-ts",
         description="ARMCI runtime",
     )
+
+    provides("armci")
 
     depends_on("mpi")
     depends_on("blas")
     depends_on("lapack")
 
     depends_on("scalapack", when="+scalapack")
+
+    depends_on("armcimpi", when="armci=armcimpi")
 
     # See release https://github.com/GlobalArrays/ga/releases/tag/v5.7.1
     conflicts("%gcc@10:", when="@5.7")
@@ -72,6 +76,9 @@ class Globalarrays(AutotoolsPackage):
             scalapack_libs = self.spec["scalapack"].libs.ld_flags
             args.append("--with-scalapack={0}".format(scalapack_libs))
 
-        args.append("--with-" + self.spec.variants["armci"].value)
+        if self.spec.variants["armci"].value == "armcimpi":
+            args.append("--with-armci=" + self.spec["armcimpi"].prefix)
+        else:
+            args.append("--with-" + self.spec.variants["armci"].value)
 
         return args
