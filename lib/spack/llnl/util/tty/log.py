@@ -10,6 +10,7 @@ import ctypes
 import errno
 import io
 import multiprocessing
+import multiprocessing.connection
 import os
 import re
 import select
@@ -33,8 +34,23 @@ except ImportError:
     pass
 
 
+esc, bell, lbracket, bslash, newline = r"\x1b", r"\x07", r"\[", r"\\", r"\n"
+# Ansi Control Sequence Introducers (CSI) are a well-defined format
+# Standard ECMA-48: Control Functions for Character-Imaging I/O Devices, section 5.4
+# https://www.ecma-international.org/wp-content/uploads/ECMA-48_5th_edition_june_1991.pdf
+csi_pre = f"{esc}{lbracket}"
+csi_param, csi_inter, csi_post = r"[0-?]", r"[ -/]", r"[@-~]"
+ansi_csi = f"{csi_pre}{csi_param}*{csi_inter}*{csi_post}"
+# General ansi escape sequences have well-defined prefixes,
+#  but content and suffixes are less reliable.
+# Conservatively assume they end with either "<ESC>\" or "<BELL>",
+#  with no intervening "<ESC>"/"<BELL>" keys or newlines
+esc_pre = f"{esc}[@-_]"
+esc_content = f"[^{esc}{bell}{newline}]"
+esc_post = f"(?:{esc}{bslash}|{bell})"
+ansi_esc = f"{esc_pre}{esc_content}*{esc_post}"
 # Use this to strip escape sequences
-_escape = re.compile(r"\x1b[^m]*m|\x1b\[?1034h|\x1b\][0-9]+;[^\x07]*\x07")
+_escape = re.compile(f"{ansi_csi}|{ansi_esc}")
 
 # control characters for enabling/disabling echo
 #
@@ -332,7 +348,19 @@ class FileWrapper:
 class MultiProcessFd:
     """Return an object which stores a file descriptor and can be passed as an
     argument to a function run with ``multiprocessing.Process``, such that
-    the file descriptor is available in the subprocess."""
+    the file descriptor is available in the subprocess. It provides access via
+    the `fd` property.
+
+    This object takes control over the associated FD: files opened from this
+    using `fdopen` need to use `closefd=False`.
+    """
+
+    # As for why you have to fdopen(..., closefd=False): when a
+    # multiprocessing.connection.Connection object stores an fd, it assumes
+    # control over it, and will attempt to close it when gc'ed during __del__;
+    # if you fdopen(multiprocessfd.fd, closefd=True) then the resulting file
+    # will also assume control, and you can see warnings when there is an
+    # attempted double close.
 
     def __init__(self, fd):
         self._connection = None
@@ -345,31 +373,18 @@ class MultiProcessFd:
     @property
     def fd(self):
         if self._connection:
-            return self._connection._handle
+            return self._connection.fileno()
         else:
             return self._fd
 
     def close(self):
+        """Rather than `.close()`ing any file opened from the associated
+        `.fd`, the `MultiProcessFd` should be closed with this.
+        """
         if self._connection:
             self._connection.close()
         else:
             os.close(self._fd)
-
-
-def close_connection_and_file(multiprocess_fd, file):
-    # MultiprocessFd is intended to transmit a FD
-    # to a child process, this FD is then opened to a Python File object
-    # (using fdopen). In >= 3.8, MultiprocessFd encapsulates a
-    # multiprocessing.connection.Connection; Connection closes the FD
-    # when it is deleted, and prints a warning about duplicate closure if
-    # it is not explicitly closed. In < 3.8, MultiprocessFd encapsulates a
-    # simple FD; closing the FD here appears to conflict with
-    # closure of the File object (in < 3.8 that is). Therefore this needs
-    # to choose whether to close the File or the Connection.
-    if sys.version_info >= (3, 8):
-        multiprocess_fd.close()
-    else:
-        file.close()
 
 
 @contextmanager
@@ -916,10 +931,10 @@ def _writer_daemon(
     # 1. Use line buffering (3rd param = 1) since Python 3 has a bug
     # that prevents unbuffered text I/O.
     # 2. Python 3.x before 3.7 does not open with UTF-8 encoding by default
-    in_pipe = os.fdopen(read_multiprocess_fd.fd, "r", 1, encoding="utf-8")
+    in_pipe = os.fdopen(read_multiprocess_fd.fd, "r", 1, encoding="utf-8", closefd=False)
 
     if stdin_multiprocess_fd:
-        stdin = os.fdopen(stdin_multiprocess_fd.fd)
+        stdin = os.fdopen(stdin_multiprocess_fd.fd, closefd=False)
     else:
         stdin = None
 
@@ -1009,9 +1024,9 @@ def _writer_daemon(
         if isinstance(log_file, io.StringIO):
             control_pipe.send(log_file.getvalue())
         log_file_wrapper.close()
-        close_connection_and_file(read_multiprocess_fd, in_pipe)
+        read_multiprocess_fd.close()
         if stdin_multiprocess_fd:
-            close_connection_and_file(stdin_multiprocess_fd, stdin)
+            stdin_multiprocess_fd.close()
 
         # send echo value back to the parent so it can be preserved.
         control_pipe.send(echo)

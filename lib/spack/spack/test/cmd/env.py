@@ -15,6 +15,7 @@ import pytest
 import llnl.util.filesystem as fs
 import llnl.util.link_tree
 import llnl.util.tty as tty
+from llnl.util.symlink import readlink
 
 import spack.cmd.env
 import spack.config
@@ -23,12 +24,21 @@ import spack.environment.depfile as depfile
 import spack.environment.environment
 import spack.environment.shell
 import spack.error
+import spack.main
 import spack.modules
+import spack.modules.tcl
 import spack.package_base
 import spack.paths
 import spack.repo
+import spack.solver.asp
+import spack.spec
+import spack.stage
+import spack.store
+import spack.util.environment
 import spack.util.spack_json as sjson
+import spack.util.spack_yaml
 from spack.cmd.env import _env_create
+from spack.installer import PackageInstaller
 from spack.main import SpackCommand, SpackCommandError
 from spack.spec import Spec
 from spack.stage import stage_prefix
@@ -39,7 +49,7 @@ from spack.version import Version
 # TODO-27021
 # everything here uses the mock_env_path
 pytestmark = [
-    pytest.mark.usefixtures("mutable_mock_env_path", "config", "mutable_mock_repo"),
+    pytest.mark.usefixtures("mutable_config", "mutable_mock_env_path", "mutable_mock_repo"),
     pytest.mark.maybeslow,
     pytest.mark.not_on_windows("Envs unsupported on Window"),
 ]
@@ -58,6 +68,27 @@ develop = SpackCommand("develop")
 module = SpackCommand("module")
 
 sep = os.sep
+
+
+def setup_combined_multiple_env():
+    env("create", "test1")
+    test1 = ev.read("test1")
+    with test1:
+        add("zlib")
+    test1.concretize()
+    test1.write()
+
+    env("create", "test2")
+    test2 = ev.read("test2")
+    with test2:
+        add("libelf")
+    test2.concretize()
+    test2.write()
+
+    env("create", "--include-concrete", "test1", "--include-concrete", "test2", "combined_env")
+    combined = ev.read("combined_env")
+
+    return test1, test2, combined
 
 
 @pytest.fixture()
@@ -248,7 +279,7 @@ def test_env_rename_managed(capfd):
     assert "baz" in out
 
 
-def test_env_rename_anonymous(capfd, tmpdir):
+def test_env_rename_independent(capfd, tmpdir):
     # Need real environment
     with pytest.raises(spack.main.SpackCommandError):
         env("rename", "-d", "./non-existing", "./also-non-existing")
@@ -369,6 +400,29 @@ def test_env_install_single_spec(install_mockery, mock_fetch):
     assert e.specs_by_hash[e.concretized_order[0]].name == "cmake-client"
 
 
+@pytest.mark.parametrize("unify", [True, False, "when_possible"])
+def test_env_install_include_concrete_env(unify, install_mockery, mock_fetch):
+    test1, test2, combined = setup_combined_multiple_env()
+
+    combined.concretize()
+    combined.write()
+
+    combined.unify = unify
+
+    with combined:
+        install()
+
+    test1_roots = test1.concretized_order
+    test2_roots = test2.concretized_order
+    combined_included_roots = combined.included_concretized_order
+
+    for spec in combined.all_specs():
+        assert spec.installed
+
+    assert test1_roots == combined_included_roots[test1.path]
+    assert test2_roots == combined_included_roots[test2.path]
+
+
 def test_env_roots_marked_explicit(install_mockery, mock_fetch):
     install = SpackCommand("install")
     install("dependent-install")
@@ -456,7 +510,7 @@ def test_env_install_two_specs_same_dep(install_mockery, mock_fetch, tmpdir, cap
                 """\
 spack:
   specs:
-  - a
+  - pkg-a
   - depb
 """
             )
@@ -475,8 +529,8 @@ spack:
     depb = spack.store.STORE.db.query_one("depb", installed=True)
     assert depb, "Expected depb to be installed"
 
-    a = spack.store.STORE.db.query_one("a", installed=True)
-    assert a, "Expected a to be installed"
+    a = spack.store.STORE.db.query_one("pkg-a", installed=True)
+    assert a, "Expected pkg-a to be installed"
 
 
 def test_remove_after_concretize():
@@ -521,40 +575,109 @@ def test_remove_command():
 
     with ev.read("test"):
         add("mpileaks")
+
+    with ev.read("test"):
         assert "mpileaks" in find()
         assert "mpileaks@" not in find()
         assert "mpileaks@" not in find("--show-concretized")
 
     with ev.read("test"):
         remove("mpileaks")
+
+    with ev.read("test"):
         assert "mpileaks" not in find()
         assert "mpileaks@" not in find()
         assert "mpileaks@" not in find("--show-concretized")
 
     with ev.read("test"):
         add("mpileaks")
+
+    with ev.read("test"):
         assert "mpileaks" in find()
         assert "mpileaks@" not in find()
         assert "mpileaks@" not in find("--show-concretized")
 
     with ev.read("test"):
         concretize()
+
+    with ev.read("test"):
         assert "mpileaks" in find()
         assert "mpileaks@" not in find()
         assert "mpileaks@" in find("--show-concretized")
 
     with ev.read("test"):
         remove("mpileaks")
+
+    with ev.read("test"):
         assert "mpileaks" not in find()
         # removed but still in last concretized specs
         assert "mpileaks@" in find("--show-concretized")
 
     with ev.read("test"):
         concretize()
+
+    with ev.read("test"):
         assert "mpileaks" not in find()
         assert "mpileaks@" not in find()
         # now the lockfile is regenerated and it's gone.
         assert "mpileaks@" not in find("--show-concretized")
+
+
+def test_remove_command_all():
+    # Need separate ev.read calls for each command to ensure we test round-trip to disk
+    env("create", "test")
+    test_pkgs = ("mpileaks", "zlib")
+
+    with ev.read("test"):
+        for name in test_pkgs:
+            add(name)
+
+    with ev.read("test"):
+        for name in test_pkgs:
+            assert name in find()
+            assert f"{name}@" not in find()
+
+    with ev.read("test"):
+        remove("-a")
+
+    with ev.read("test"):
+        for name in test_pkgs:
+            assert name not in find()
+
+
+def test_bad_remove_included_env():
+    env("create", "test")
+    test = ev.read("test")
+
+    with test:
+        add("mpileaks")
+
+    test.concretize()
+    test.write()
+
+    env("create", "--include-concrete", "test", "combined_env")
+
+    with pytest.raises(SpackCommandError):
+        env("remove", "test")
+
+
+def test_force_remove_included_env():
+    env("create", "test")
+    test = ev.read("test")
+
+    with test:
+        add("mpileaks")
+
+    test.concretize()
+    test.write()
+
+    env("create", "--include-concrete", "test", "combined_env")
+
+    rm_output = env("remove", "-f", "-y", "test")
+    list_output = env("list")
+
+    assert '"test" is being used by environment "combined_env"' in rm_output
+    assert "test" not in list_output
 
 
 def test_environment_status(capsys, tmpdir):
@@ -681,6 +804,39 @@ spack:
     assert not any(x.name == "hypre" for x in env_specs)
 
 
+def test_lockfile_spliced_specs(environment_from_manifest, install_mockery):
+    """Test that an environment can round-trip a spliced spec."""
+    # Create a local install for zmpi to splice in
+    # Default concretization is not using zmpi
+    zmpi = spack.spec.Spec("zmpi").concretized()
+    PackageInstaller([zmpi.package], fake=True).install()
+
+    e1 = environment_from_manifest(
+        f"""
+spack:
+  specs:
+  - mpileaks
+  concretizer:
+    splice:
+      explicit:
+      - target: mpi
+        replacement: zmpi/{zmpi.dag_hash()}
+"""
+    )
+    with e1:
+        e1.concretize()
+        e1.write()
+
+    # By reading into a second environment, we force a round trip to json
+    e2 = _env_create("test2", init_file=e1.lock_path)
+
+    # The one spec is mpileaks
+    for _, spec in e2.concretized_specs():
+        assert spec.spliced
+        assert spec["mpi"].satisfies(f"zmpi@{zmpi.version}")
+        assert spec["mpi"].build_spec.satisfies(zmpi)
+
+
 def test_init_from_lockfile(environment_from_manifest):
     """Test that an environment can be instantiated from a lockfile."""
     e1 = environment_from_manifest(
@@ -732,7 +888,6 @@ spack:
     assert not e2.specs_by_hash
 
 
-@pytest.mark.usefixtures("config")
 def test_env_view_external_prefix(tmp_path, mutable_database, mock_packages):
     fake_prefix = tmp_path / "a-prefix"
     fake_bin = fake_prefix / "bin"
@@ -745,7 +900,7 @@ def test_env_view_external_prefix(tmp_path, mutable_database, mock_packages):
         """\
 spack:
   specs:
-  - a
+  - pkg-a
   view: true
 """
     )
@@ -753,9 +908,9 @@ spack:
     external_config = io.StringIO(
         """\
 packages:
-  a:
+  pkg-a:
     externals:
-    - spec: a@2.0
+    - spec: pkg-a@2.0
       prefix: {a_prefix}
     buildable: false
 """.format(
@@ -976,7 +1131,6 @@ spack:
     assert any(x.satisfies("mpileaks@2.2") for x in e._get_environment_specs())
 
 
-@pytest.mark.only_clingo("original concretizer does not support requirements")
 def test_config_change_existing(mutable_mock_env_path, tmp_path, mock_packages, mutable_config):
     """Test ``config change`` with config in the ``spack.yaml`` as well as an
     included file scope.
@@ -1052,7 +1206,6 @@ spack:
         spack.spec.Spec("bowtie@1.2.2").concretized()
 
 
-@pytest.mark.only_clingo("original concretizer does not support requirements")
 def test_config_change_new(mutable_mock_env_path, tmp_path, mock_packages, mutable_config):
     spack_yaml = tmp_path / ev.manifest_name
     spack_yaml.write_text(
@@ -1081,7 +1234,7 @@ spack:
     )
     with ev.Environment(tmp_path):
         assert spack.spec.Spec("mpich").concretized().satisfies("@3.0.3")
-        with pytest.raises(spack.config.ConfigError, match="not a list"):
+        with pytest.raises(spack.error.ConfigError, match="not a list"):
             config("change", "packages:mpich:require:~debug")
 
 
@@ -1109,7 +1262,7 @@ def test_env_with_included_config_missing_file(tmpdir, mutable_empty_config):
     with spack_yaml.open("w") as f:
         f.write("spack:\n  include:\n    - {0}\n".format(missing_file.strpath))
 
-    with pytest.raises(spack.config.ConfigError, match="missing include path"):
+    with pytest.raises(spack.error.ConfigError, match="missing include path"):
         ev.Environment(tmpdir.strpath)
 
 
@@ -1479,7 +1632,6 @@ def test_uninstall_removes_from_env(mock_stage, mock_fetch, install_mockery):
     assert not test.user_specs
 
 
-@pytest.mark.usefixtures("config")
 def test_indirect_build_dep(tmp_path):
     """Simple case of X->Y->Z where Y is a build/link dep and Z is a
     build-only dep. Make sure this concrete DAG is preserved when writing the
@@ -1507,7 +1659,6 @@ def test_indirect_build_dep(tmp_path):
         assert x_env_spec == x_concretized
 
 
-@pytest.mark.usefixtures("config")
 def test_store_different_build_deps(tmp_path):
     r"""Ensure that an environment can store two instances of a build-only
     dependency::
@@ -1634,6 +1785,286 @@ def test_env_without_view_install(tmpdir, mock_stage, mock_fetch, install_mocker
     # After enabling the view, the specs should be linked into the environment
     # view dir
     check_mpileaks_and_deps_in_view(view_dir)
+
+
+@pytest.mark.parametrize("env_name", [True, False])
+def test_env_include_concrete_env_yaml(env_name):
+    env("create", "test")
+    test = ev.read("test")
+
+    with test:
+        add("mpileaks")
+    test.concretize()
+    test.write()
+
+    environ = "test" if env_name else test.path
+
+    env("create", "--include-concrete", environ, "combined_env")
+
+    combined = ev.read("combined_env")
+    combined_yaml = combined.manifest["spack"]
+
+    assert "include_concrete" in combined_yaml
+    assert test.path in combined_yaml["include_concrete"]
+
+
+@pytest.mark.regression("45766")
+@pytest.mark.parametrize("format", ["v1", "v2", "v3"])
+def test_env_include_concrete_old_env(format, tmpdir):
+    lockfile = os.path.join(spack.paths.test_path, "data", "legacy_env", f"{format}.lock")
+    # create an env from old .lock file -- this does not update the format
+    env("create", "old-env", lockfile)
+    env("create", "--include-concrete", "old-env", "test")
+
+    assert ev.read("old-env").all_specs() == ev.read("test").all_specs()
+
+
+def test_env_bad_include_concrete_env():
+    with pytest.raises(ev.SpackEnvironmentError):
+        env("create", "--include-concrete", "nonexistant_env", "combined_env")
+
+
+def test_env_not_concrete_include_concrete_env():
+    env("create", "test")
+    test = ev.read("test")
+
+    with test:
+        add("mpileaks")
+
+    with pytest.raises(ev.SpackEnvironmentError):
+        env("create", "--include-concrete", "test", "combined_env")
+
+
+def test_env_multiple_include_concrete_envs():
+    test1, test2, combined = setup_combined_multiple_env()
+
+    combined_yaml = combined.manifest["spack"]
+
+    assert test1.path in combined_yaml["include_concrete"][0]
+    assert test2.path in combined_yaml["include_concrete"][1]
+
+    # No local specs in the combined env
+    assert not combined_yaml["specs"]
+
+
+def test_env_include_concrete_envs_lockfile():
+    test1, test2, combined = setup_combined_multiple_env()
+
+    combined_yaml = combined.manifest["spack"]
+
+    assert "include_concrete" in combined_yaml
+    assert test1.path in combined_yaml["include_concrete"]
+
+    with open(combined.lock_path) as f:
+        lockfile_as_dict = combined._read_lockfile(f)
+
+    assert set(
+        entry["hash"] for entry in lockfile_as_dict["include_concrete"][test1.path]["roots"]
+    ) == set(test1.specs_by_hash)
+    assert set(
+        entry["hash"] for entry in lockfile_as_dict["include_concrete"][test2.path]["roots"]
+    ) == set(test2.specs_by_hash)
+
+
+def test_env_include_concrete_add_env():
+    test1, test2, combined = setup_combined_multiple_env()
+
+    # crete new env & crecretize
+    env("create", "new")
+    new_env = ev.read("new")
+    with new_env:
+        add("mpileaks")
+
+    new_env.concretize()
+    new_env.write()
+
+    # add new env to combined
+    combined.included_concrete_envs.append(new_env.path)
+
+    # assert thing haven't changed yet
+    with open(combined.lock_path) as f:
+        lockfile_as_dict = combined._read_lockfile(f)
+
+    assert new_env.path not in lockfile_as_dict["include_concrete"].keys()
+
+    # concretize combined env with new env
+    combined.concretize()
+    combined.write()
+
+    # assert changes
+    with open(combined.lock_path) as f:
+        lockfile_as_dict = combined._read_lockfile(f)
+
+    assert new_env.path in lockfile_as_dict["include_concrete"].keys()
+
+
+def test_env_include_concrete_remove_env():
+    test1, test2, combined = setup_combined_multiple_env()
+
+    # remove test2 from combined
+    combined.included_concrete_envs = [test1.path]
+
+    # assert test2 is still in combined's lockfile
+    with open(combined.lock_path) as f:
+        lockfile_as_dict = combined._read_lockfile(f)
+
+    assert test2.path in lockfile_as_dict["include_concrete"].keys()
+
+    # reconcretize combined
+    combined.concretize()
+    combined.write()
+
+    # assert test2 is not in combined's lockfile
+    with open(combined.lock_path) as f:
+        lockfile_as_dict = combined._read_lockfile(f)
+
+    assert test2.path not in lockfile_as_dict["include_concrete"].keys()
+
+
+@pytest.mark.parametrize("unify", [True, False, "when_possible"])
+def test_env_include_concrete_env_reconcretized(unify):
+    """Double check to make sure that concrete_specs for the local specs is empty
+    after recocnretizing.
+    """
+    _, _, combined = setup_combined_multiple_env()
+
+    combined.unify = unify
+
+    with open(combined.lock_path) as f:
+        lockfile_as_dict = combined._read_lockfile(f)
+
+    assert not lockfile_as_dict["roots"]
+    assert not lockfile_as_dict["concrete_specs"]
+
+    combined.concretize()
+    combined.write()
+
+    with open(combined.lock_path) as f:
+        lockfile_as_dict = combined._read_lockfile(f)
+
+    assert not lockfile_as_dict["roots"]
+    assert not lockfile_as_dict["concrete_specs"]
+
+
+def test_concretize_include_concrete_env():
+    test1, _, combined = setup_combined_multiple_env()
+
+    with test1:
+        add("mpileaks")
+    test1.concretize()
+    test1.write()
+
+    assert Spec("mpileaks") in test1.concretized_user_specs
+    assert Spec("mpileaks") not in combined.included_concretized_user_specs[test1.path]
+
+    combined.concretize()
+    combined.write()
+
+    assert Spec("mpileaks") in combined.included_concretized_user_specs[test1.path]
+
+
+def test_concretize_nested_include_concrete_envs():
+    env("create", "test1")
+    test1 = ev.read("test1")
+    with test1:
+        add("zlib")
+    test1.concretize()
+    test1.write()
+
+    env("create", "--include-concrete", "test1", "test2")
+    test2 = ev.read("test2")
+    with test2:
+        add("libelf")
+    test2.concretize()
+    test2.write()
+
+    env("create", "--include-concrete", "test2", "test3")
+    test3 = ev.read("test3")
+
+    with open(test3.lock_path) as f:
+        lockfile_as_dict = test3._read_lockfile(f)
+
+    assert test2.path in lockfile_as_dict["include_concrete"]
+    assert test1.path in lockfile_as_dict["include_concrete"][test2.path]["include_concrete"]
+
+    assert Spec("zlib") in test3.included_concretized_user_specs[test1.path]
+
+
+def test_concretize_nested_included_concrete():
+    """Confirm that nested included environments use specs concretized at
+    environment creation time and change with reconcretization."""
+    env("create", "test1")
+    test1 = ev.read("test1")
+    with test1:
+        add("zlib")
+    test1.concretize()
+    test1.write()
+
+    # test2 should include test1 with zlib
+    env("create", "--include-concrete", "test1", "test2")
+    test2 = ev.read("test2")
+    with test2:
+        add("libelf")
+    test2.concretize()
+    test2.write()
+
+    assert Spec("zlib") in test2.included_concretized_user_specs[test1.path]
+
+    # Modify/re-concretize test1 to replace zlib with mpileaks
+    with test1:
+        remove("zlib")
+        add("mpileaks")
+    test1.concretize()
+    test1.write()
+
+    # test3 should include the latest concretization of test1
+    env("create", "--include-concrete", "test1", "test3")
+    test3 = ev.read("test3")
+    with test3:
+        add("callpath")
+    test3.concretize()
+    test3.write()
+
+    included_specs = test3.included_concretized_user_specs[test1.path]
+    assert len(included_specs) == 1
+    assert Spec("mpileaks") in included_specs
+
+    # The last concretization of test4's included environments should have test2
+    # with the original concretized test1 spec and test3 with the re-concretized
+    # test1 spec.
+    env("create", "--include-concrete", "test2", "--include-concrete", "test3", "test4")
+    test4 = ev.read("test4")
+
+    def included_included_spec(path1, path2):
+        included_path1 = test4.included_concrete_spec_data[path1]
+        included_path2 = included_path1["include_concrete"][path2]
+        return included_path2["roots"][0]["spec"]
+
+    included_test2_test1 = included_included_spec(test2.path, test1.path)
+    assert "zlib" in included_test2_test1
+
+    included_test3_test1 = included_included_spec(test3.path, test1.path)
+    assert "mpileaks" in included_test3_test1
+
+    # test4's concretized specs should reflect the original concretization.
+    concrete_specs = [s for s, _ in test4.concretized_specs()]
+    expected = [Spec(s) for s in ["libelf", "zlib", "mpileaks", "callpath"]]
+    assert all(s in concrete_specs for s in expected)
+
+    # Re-concretize test2 to reflect the new concretization of included test1
+    # to remove zlib and write it out so it can be picked up by test4.
+    # Re-concretize test4 to reflect the re-concretization of included test2
+    # and ensure that its included specs are up-to-date
+    test2.concretize()
+    test2.write()
+    test4.concretize()
+
+    concrete_specs = [s for s, _ in test4.concretized_specs()]
+    assert Spec("zlib") not in concrete_specs
+
+    # Expecting mpileaks to appear only once
+    expected = [Spec(s) for s in ["libelf", "mpileaks", "callpath"]]
+    assert len(concrete_specs) == 3 and all(s in concrete_specs for s in expected)
 
 
 def test_env_config_view_default(
@@ -1977,105 +2408,6 @@ spack:
             mpileaks_spec = Spec("mpileaks target=be")
             assert mpileaks_spec in before_conc
             assert mpileaks_spec not in after_conc
-
-
-def test_stack_concretize_extraneous_deps(tmpdir, config, mock_packages):
-    # FIXME: The new concretizer doesn't handle yet soft
-    # FIXME: constraints for stacks
-    # FIXME: This now works for statically-determinable invalid deps
-    # FIXME: But it still does not work for dynamically determined invalid deps
-    # if spack.config.get('config:concretizer') == 'clingo':
-    #    pytest.skip('Clingo concretizer does not support soft constraints')
-
-    filename = str(tmpdir.join("spack.yaml"))
-    with open(filename, "w") as f:
-        f.write(
-            """\
-spack:
-  definitions:
-    - packages: [libelf, mpileaks]
-    - install:
-        - matrix:
-            - [$packages]
-            - ['^zmpi', '^mpich']
-  specs:
-    - $install
-"""
-        )
-    with tmpdir.as_cwd():
-        env("create", "test", "./spack.yaml")
-        with ev.read("test"):
-            concretize()
-
-        test = ev.read("test")
-
-        for user, concrete in test.concretized_specs():
-            assert concrete.concrete
-            assert not user.concrete
-            if user.name == "libelf":
-                assert not concrete.satisfies("^mpi")
-            elif user.name == "mpileaks":
-                assert concrete.satisfies("^mpi")
-
-
-def test_stack_concretize_extraneous_variants(tmpdir, config, mock_packages):
-    filename = str(tmpdir.join("spack.yaml"))
-    with open(filename, "w") as f:
-        f.write(
-            """\
-spack:
-  definitions:
-    - packages: [libelf, mpileaks]
-    - install:
-        - matrix:
-            - [$packages]
-            - ['~shared', '+shared']
-  specs:
-    - $install
-"""
-        )
-    with tmpdir.as_cwd():
-        env("create", "test", "./spack.yaml")
-        with ev.read("test"):
-            concretize()
-
-        test = ev.read("test")
-
-        for user, concrete in test.concretized_specs():
-            assert concrete.concrete
-            assert not user.concrete
-            if user.name == "libelf":
-                assert "shared" not in concrete.variants
-            if user.name == "mpileaks":
-                assert concrete.variants["shared"].value == user.variants["shared"].value
-
-
-def test_stack_concretize_extraneous_variants_with_dash(tmpdir, config, mock_packages):
-    filename = str(tmpdir.join("spack.yaml"))
-    with open(filename, "w") as f:
-        f.write(
-            """\
-spack:
-  definitions:
-    - packages: [libelf, mpileaks]
-    - install:
-        - matrix:
-            - [$packages]
-            - ['shared=False', '+shared-libs']
-  specs:
-    - $install
-"""
-        )
-    with tmpdir.as_cwd():
-        env("create", "test", "./spack.yaml")
-        with ev.read("test"):
-            concretize()
-
-        ev.read("test")
-
-        # Regression test for handling of variants with dashes in them
-        # will fail before this point if code regresses
-        assert True
 
 
 def test_stack_definition_extension(tmpdir):
@@ -2832,9 +3164,7 @@ def test_concretize_user_specs_together():
     e.remove("mpich")
     e.add("mpich2")
 
-    exc_cls = spack.error.SpackError
-    if spack.config.get("config:concretizer") == "clingo":
-        exc_cls = spack.error.UnsatisfiableSpecError
+    exc_cls = spack.error.UnsatisfiableSpecError
 
     # Concretizing without invalidating the concrete spec for mpileaks fails
     with pytest.raises(exc_cls):
@@ -2860,10 +3190,8 @@ def test_duplicate_packages_raise_when_concretizing_together():
     e.add("mpileaks~opt")
     e.add("mpich")
 
-    exc_cls, match = spack.error.SpackError, None
-    if spack.config.get("config:concretizer") == "clingo":
-        exc_cls = spack.error.UnsatisfiableSpecError
-        match = r"You could consider setting `concretizer:unify`"
+    exc_cls = spack.error.UnsatisfiableSpecError
+    match = r"You could consider setting `concretizer:unify`"
 
     with pytest.raises(exc_cls, match=match):
         e.concretize()
@@ -3287,10 +3615,10 @@ def test_create_and_activate_managed(tmp_path):
         env("deactivate")
 
 
-def test_create_and_activate_anonymous(tmp_path):
+def test_create_and_activate_independent(tmp_path):
     with fs.working_dir(str(tmp_path)):
         env_dir = os.path.join(str(tmp_path), "foo")
-        shell = env("activate", "--without-view", "--create", "--sh", "-d", env_dir)
+        shell = env("activate", "--without-view", "--create", "--sh", env_dir)
         active_env_var = next(line for line in shell.splitlines() if ev.spack_env_var in line)
         assert str(env_dir) in active_env_var
         assert ev.is_env_dir(env_dir)
@@ -3401,7 +3729,7 @@ def test_environment_query_spec_by_hash(mock_stage, mock_fetch, install_mockery)
 
 
 @pytest.mark.parametrize("lockfile", ["v1", "v2", "v3"])
-def test_read_old_lock_and_write_new(config, tmpdir, lockfile):
+def test_read_old_lock_and_write_new(tmpdir, lockfile):
     # v1 lockfiles stored by a coarse DAG hash that did not include build deps.
     # They could not represent multiple build deps with different build hashes.
     #
@@ -3467,7 +3795,7 @@ def test_read_old_lock_and_write_new(config, tmpdir, lockfile):
     assert old_hashes == hashes
 
 
-def test_read_v1_lock_creates_backup(config, tmp_path):
+def test_read_v1_lock_creates_backup(tmp_path):
     """When reading a version-1 lockfile, make sure that a backup of that file
     is created.
     """
@@ -3625,7 +3953,7 @@ def test_environment_depfile_makefile(depfile_flags, expected_installs, tmpdir, 
         )
 
     # Do make dry run.
-    out = make("-n", "-f", makefile, output=str)
+    out = make("-n", "-f", makefile, "SPACK=spack", output=str)
 
     specs_that_make_would_install = _parse_dry_run_package_installs(out)
 
@@ -3663,7 +3991,7 @@ def test_depfile_works_with_gitversions(tmpdir, mock_packages, monkeypatch):
         env("depfile", "-o", makefile, "--make-disable-jobserver", "--make-prefix=prefix")
 
     # Do a dry run on the generated depfile
-    out = make("-n", "-f", makefile, output=str)
+    out = make("-n", "-f", makefile, "SPACK=spack", output=str)
 
     # Check that all specs are there (without duplicates)
     specs_that_make_would_install = _parse_dry_run_package_installs(out)
@@ -3725,7 +4053,12 @@ def test_depfile_phony_convenience_targets(
 
         # Phony install/* target should install picked package and all its deps
         specs_that_make_would_install = _parse_dry_run_package_installs(
-            make("-n", picked_spec.format("install/{name}-{version}-{hash}"), output=str)
+            make(
+                "-n",
+                picked_spec.format("install/{name}-{version}-{hash}"),
+                "SPACK=spack",
+                output=str,
+            )
         )
 
         assert set(specs_that_make_would_install) == set(expected_installs)
@@ -3733,7 +4066,12 @@ def test_depfile_phony_convenience_targets(
 
         # Phony install-deps/* target shouldn't install picked package
         specs_that_make_would_install = _parse_dry_run_package_installs(
-            make("-n", picked_spec.format("install-deps/{name}-{version}-{hash}"), output=str)
+            make(
+                "-n",
+                picked_spec.format("install-deps/{name}-{version}-{hash}"),
+                "SPACK=spack",
+                output=str,
+            )
         )
 
         assert set(specs_that_make_would_install) == set(expected_installs) - {picked_package}
@@ -3793,7 +4131,7 @@ post-install: $(addprefix example/post-install/,$(example/SPACK_PACKAGE_IDS))
     make = Executable("make")
 
     # Do dry run.
-    out = make("-n", "-C", str(tmpdir), output=str)
+    out = make("-n", "-C", str(tmpdir), "SPACK=spack", output=str)
 
     # post-install: <hash> should've been executed
     with ev.read("test") as test:
@@ -3850,7 +4188,7 @@ def test_env_include_packages_url(
         assert "openmpi" in cfg["all"]["providers"]["mpi"]
 
 
-def test_relative_view_path_on_command_line_is_made_absolute(tmp_path, config):
+def test_relative_view_path_on_command_line_is_made_absolute(tmp_path):
     with fs.working_dir(str(tmp_path)):
         env("create", "--with-view", "view", "--dir", "env")
         environment = ev.Environment(os.path.join(".", "env"))
@@ -3950,9 +4288,6 @@ spack:
 {''.join(includes)}
   specs:
   - mpileaks
-  packages:
-    mpileaks:
-      compiler: [gcc]
 """
     )
 
@@ -4066,8 +4401,8 @@ def test_env_view_resolves_identical_file_conflicts(tmp_path, install_mockery, m
     #   view-file/bin/
     #     x                                          # expect this x to be linked
 
-    assert os.readlink(tmp_path / "view" / "bin" / "x") == bottom.bin.x
-    assert os.readlink(tmp_path / "view" / "bin" / "y") == top.bin.y
+    assert readlink(tmp_path / "view" / "bin" / "x") == bottom.bin.x
+    assert readlink(tmp_path / "view" / "bin" / "y") == top.bin.y
 
 
 def test_env_view_ignores_different_file_conflicts(tmp_path, install_mockery, mock_fetch):
@@ -4078,4 +4413,4 @@ def test_env_view_ignores_different_file_conflicts(tmp_path, install_mockery, mo
         install()
         prefix_dependent = e.matching_spec("view-ignore-conflict").prefix
     # The dependent's file is linked into the view
-    assert os.readlink(tmp_path / "view" / "bin" / "x") == prefix_dependent.bin.x
+    assert readlink(tmp_path / "view" / "bin" / "x") == prefix_dependent.bin.x

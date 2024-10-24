@@ -241,7 +241,6 @@ ci:
       - mvapich2
       - netlib-scalapack
       - omega-h
-      - openblas
       - openjpeg
       - openmpi
       - openpmd-api
@@ -259,7 +258,6 @@ ci:
       - py-scipy
       - py-statsmodels
       - py-warlock
-      - py-warpx
       - raja
       - slepc
       - slurm
@@ -273,6 +271,7 @@ ci:
       - vtk
       - vtk-h
       - vtk-m
+      - warpx +python
       - zfp
       build-job:
         tags: [ "spack", "medium" ]
@@ -394,7 +393,6 @@ ci:
       - ncurses
       - ninja
       - numactl
-      - openblas
       - openjdk
       - openssh
       - openssl

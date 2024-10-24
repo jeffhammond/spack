@@ -29,6 +29,7 @@ class IntelOneapiRuntime(Package):
     LIBRARIES = [
         "imf",
         "intlc",
+        "irc",
         "irng",
         "svml",
         "ifcore",  # Fortran
@@ -45,7 +46,7 @@ class IntelOneapiRuntime(Package):
     conflicts("platform=windows", msg="IntelOneAPI can only be installed on Linux, and FreeBSD")
     conflicts("platform=darwin", msg="IntelOneAPI can only be installed on Linux, and FreeBSD")
 
-    depends_on("libc", type="link")
+    depends_on("libc", type="link", when="platform=linux")
 
     def install(self, spec, prefix):
         libraries = get_elf_libraries(compiler=self.compiler, libraries=self.LIBRARIES)
